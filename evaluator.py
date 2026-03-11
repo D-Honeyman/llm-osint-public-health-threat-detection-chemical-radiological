@@ -363,12 +363,12 @@ def main():
 
     parser.add_argument(
         "--input",
-        default="/home/Chemical/dh/ews-nlp-llm-inference/chem_work/chem_evaluation_200.xlsx"
+        default="INSERT_INPUT_FILE"
     )
 
     parser.add_argument(
         "--output",
-        default="/home/Chemical/dh/ews-nlp-llm-inference/chem_work/chem_evaluation_200_evaluated.csv"
+        default="NAME_YOUR_OUTPUT_FILE"
     )
 
     parser.add_argument(
