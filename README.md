@@ -1,4 +1,4 @@
-LLM Evaluation for Detection of Chemical and Radiological Public Health Events
+# LLM Evaluation for Detection of Chemical and Radiological Public Health Events
 
 Dataset and evaluation code for benchmarking a large language model for detecting
 chemical and radiological public health threats from open-source intelligence (OSINT)
@@ -13,7 +13,7 @@ benchmark dataset for future research in event-based public health surveillance 
 large language models.
 
 
-Overview
+## Overview
 
 Large language models are increasingly used for automated detection of emerging public
 health threats from open-source intelligence such as news media. Reproducible evaluation
@@ -29,12 +29,12 @@ The evaluation pipeline used to compute precision, recall and F1 scores
 
 
 
-Repository contents
+##Repository contents
 
 FileDescriptionevaluator.pyEvaluation pipeline (entity parsing, matching, metrics)evaluation_dataset_200_articles.xlsxGold-standard dataset with LLM and human annotationsrequirements.txtPython dependenciesLICENSEMIT
 
 
-Dataset
+##Dataset
 
 The evaluation dataset contains 200 news articles, each manually annotated by human
 reviewers. Each row is a single article.
@@ -45,9 +45,9 @@ Annotations follow a structured bullet-list format representing the entities ext
 from each article.
 
 
-Entities evaluated
+## Entities evaluated
 
-Threat entities
+**Threat entities**
 
 
 Event identification
@@ -57,7 +57,7 @@ Fatality count
 Case number
 
 
-Location entities
+**Location entities**
 
 
 Country
@@ -66,7 +66,7 @@ County
 City
 
 
-Temporal entities
+**Temporal entities**
 
 
 Timeframe
@@ -78,7 +78,7 @@ reported as COUNTRY, and Answer is reported as Event identification. These
 standardise reporting terminology and do not alter the underlying annotations.
 
 
-Evaluation method
+## Evaluation method
 
 The script computes entity-level precision, recall and F1, with 95 per cent
 Clopper-Pearson confidence intervals.
@@ -86,17 +86,17 @@ Clopper-Pearson confidence intervals.
 The pipeline performs:
 
 
-Parsing of structured entity annotations
-Label normalisation
-Entity matching, combining exact string matching with semantic similarity from
-sentence embeddings, resolved via optimal (Hungarian) assignment
-Calculation of evaluation metrics
+1. Parsing of structured entity annotations
+2. Label normalisation
+3. Entity matching, combining exact string matching with semantic similarity from
+    sentence embeddings, resolved via optimal (Hungarian) assignment
+4. Calculation of evaluation metrics
 
 
 Embedding-based matching uses sentence-transformers/all-MiniLM-L6-v2.
 
 
-Installation
+## Installation
 
 bashgit clone https://github.com/D-Honeyman/llm-osint-public-health-threat-detection-chemical-radiological.git
 cd llm-osint-public-health-threat-detection-chemical-radiological
@@ -105,7 +105,7 @@ pip install -r requirements.txt
 Python 3.9 or later is recommended.
 
 
-Running the evaluation
+## Running the evaluation
 
 bashpython evaluator.py
 
@@ -120,7 +120,7 @@ bashpython evaluator.py \
   --embedding_model sentence-transformers/all-MiniLM-L6-v2
 
 
-Reproducibility
+## Reproducibility
 
 The proprietary components used to collect and process the original news data,
 including the news API ingestion pipeline and large-scale scraping infrastructure,
@@ -130,13 +130,13 @@ The components required to reproduce the reported evaluation results are provide
 the LLM inference outputs, the human gold-standard annotations, and the evaluation code.
 
 
-Citation
+## Citation
 
 Honeyman DA, Heslop DJ, MacIntyre CR. Chemical and Radiation Threat Detection Using a
 Large Language Model. Under review, International Journal of Data Science and Analytics.
 
 
-License
+## License
 
 Released under the MIT License.
 
