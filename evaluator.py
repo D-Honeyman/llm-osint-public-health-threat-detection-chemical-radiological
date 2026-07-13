@@ -363,12 +363,12 @@ def main():
 
     parser.add_argument(
         "--input",
-        default="INSERT_INPUT_FILE"
+        default="evaluation_dataset_200_articles.xlsx"
     )
 
     parser.add_argument(
         "--output",
-        default="NAME_YOUR_OUTPUT_FILE"
+        default="evaluation_results.csv"
     )
 
     parser.add_argument(
