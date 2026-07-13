@@ -51,7 +51,7 @@ Annotations follow a structured bullet-list format representing entities extract
 
 The evaluation measures extraction performance for the following entities:
 
-- Event identification
+- EVENT IDENTIFICATION
 - CHEMICAL SUBSTANCE
 - RADIOLOGICAL SUBSTANCE
 - FATALITY COUNT
@@ -61,12 +61,12 @@ The evaluation measures extraction performance for the following entities:
 - COUNTY
 - CITY
 - TIMEFRAME
-- Years
-- Months
-- Dates
-- date
-- Dates or days of the week
-- Adverbs
+- YEARS
+- MONTHS
+- DATES
+- DATE
+- DATES OR DAYS OF THE WEEK
+- ADVERBS OF TIME
 
 Two reporting transformations are applied in the evaluation script:
 
