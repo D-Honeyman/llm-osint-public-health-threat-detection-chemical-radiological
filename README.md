@@ -31,7 +31,9 @@ The evaluation pipeline used to compute precision, recall and F1 scores
 
 ##Repository contents
 
-FileDescriptionevaluator.pyEvaluation pipeline (entity parsing, matching, metrics)evaluation_dataset_200_articles.xlsxGold-standard dataset with LLM and human annotationsrequirements.txtPython dependenciesLICENSEMIT
+evaluator.py - Evaluation pipeline (entity parsing, matching, metrics)
+evaluation_dataset_200_articles.xlsx - Gold-standard dataset with LLM and human annotations 
+requirements.txt  - Python dependencies
 
 
 ##Dataset
