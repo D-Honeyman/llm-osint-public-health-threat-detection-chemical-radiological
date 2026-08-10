@@ -6,386 +6,226 @@ in the manuscript using a 200-article gold-standard dataset annotated by human r
 
 Author: Damian Honeyman et al.
 """
-import argparse
+
+import argparse, itertools, collections, re
 import pandas as pd
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy.optimize import linear_sum_assignment
 from scipy.stats import beta
 
+LABEL_MAP = {
+    "chemical substance": "CHEMICAL SUBSTANCE", "radiological substance": "RADIOLOGICAL SUBSTANCE",
+    "fatality count": "FATALITY COUNT", "case number": "CASE NUMBER",
+    "state": "STATE", "county": "COUNTY", "city": "CITY", "location": "LOCATION",
+    "timeframe": "TIMEFRAME", "answer": "Answer", "adverbs": "Adverbs",
+    "years": "Years", "months": "Months", "dates": "Dates", "date": "date",
+    "dates or days of the week": "Dates or days of the week",
+}
 
-class NEREvaluation:
-    def __init__(self, input_path: str, embedding_model: str):
-        self.input_path = input_path
+def normalize_label(label):
+    return LABEL_MAP.get(str(label).strip().lower(), str(label).strip())
 
-        if input_path.lower().endswith(".xlsx"):
-            self.df = pd.read_excel(input_path)
+def parse(text):
+    if pd.isna(text) or str(text).strip() == "":
+        return {}
+    out, current = {}, None
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("-"):
+            line = line[1:].strip()
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = normalize_label(k); v = v.strip()
+            out.setdefault(k, []); current = k
+            if v:
+                out[k].append(v)
+        elif current is not None:
+            out.setdefault(current, []).append(line)
+    for k, vs in out.items():
+        seen, dedup = set(), []
+        for v in vs:
+            s = str(v).strip()
+            if s.lower() not in seen:
+                dedup.append(s); seen.add(s.lower())
+        out[k] = dedup
+    return out
+
+NULL_TOKEN = "\x00NULL"
+NULL_EXACT = {"not mentioned", "not reported", "unknown", "none", "n/a",
+              "not applicable", "not specified", "not stated", "not provided"}
+
+MALFORMED = re.compile(r"adverbs of time convey", re.I)
+
+def canon(v):
+    s = str(v).strip().lower().rstrip(".")
+    if s in NULL_EXACT:
+        return NULL_TOKEN
+    if re.match(r"^not mentioned\b", s):
+        return NULL_TOKEN
+    if s.endswith(": not mentioned"):
+        return NULL_TOKEN
+    return s
+
+def score_set(pred_vals, gold_vals):
+    """C2: a null present on both sides is one true negative."""
+    ps = {canon(v) for v in pred_vals}
+    gs = {canon(v) for v in gold_vals}
+    tp = fp = fn = tn = 0
+    for v in ps & gs:
+        if v == NULL_TOKEN:
+            tn += 1
         else:
-            self.df = pd.read_csv(input_path)
+            tp += 1
+    for v in ps - gs:
+        fp += 1
+    for v in gs - ps:
+        fn += 1
+    return tp, fp, fn, tn
 
-        self.embedding_model = SentenceTransformer(embedding_model, trust_remote_code=True)
+def cp(x, n, alpha=0.05):
+    if n == 0:
+        return None, None
+    x, n = int(x), int(n)
+    lo = 0.0 if x == 0 else float(beta.ppf(alpha / 2, x, n - x + 1))
+    hi = 1.0 if x == n else float(beta.ppf(1 - alpha / 2, x + 1, n - x))
+    return lo, hi
 
-    def normalize_label(self, label: str):
+def prf(tp, fp, fn):
+    p = tp / (tp + fp) if tp + fp else 0.0
+    r = tp / (tp + fn) if tp + fn else 0.0
+    f = 2 * p * r / (p + r) if p + r else 0.0
+    return p, r, f
 
-        cleaned = str(label).strip()
+ENTITY_FIELDS = {                      
+    "Fatality count":          ["FATALITY COUNT"],
+    "Case number":             ["CASE NUMBER"],
+    "Chemical substance":      ["CHEMICAL SUBSTANCE"],
+    "Radiological substance":  ["RADIOLOGICAL SUBSTANCE"],
+    "Country":                 ["LOCATION"],
+    "State":                   ["STATE"],
+    "County":                  ["COUNTY"],
+    "City":                    ["CITY"],
+}
 
-        mapping = {
-            "chemical substance": "CHEMICAL SUBSTANCE",
-            "radiological substance": "RADIOLOGICAL SUBSTANCE",
-            "fatality count": "FATALITY COUNT",
-            "case number": "CASE NUMBER",
-            "state": "STATE",
-            "county": "COUNTY",
-            "city": "CITY",
-            "location": "LOCATION",
-            "timeframe": "TIMEFRAME",
-            "answer": "Answer",
-            "adverbs": "Adverbs",
-            "years": "Years",
-            "months": "Months",
-            "dates": "Dates",
-            "date": "date",
-            "dates or days of the week": "Dates or days of the week",
-        }
+TEMPORAL_FIELDS = {
+    "Date and Timeframe":    ["date"],      
+    "Temporal expressions":  ["Dates"],
+}
 
-        return mapping.get(cleaned.lower(), cleaned)
+TEMPORAL_DIAGNOSTIC = {
+    "[not reported] TIMEFRAME field":  ["TIMEFRAME"],
+    "[not reported] Years field":      ["Years"],
+    "[not reported] Months field":     ["Months"],
+    "[not reported] Adverbs field":    ["Adverbs"],
+}
 
-    def convert_entities_to_dictionary(self, text: str):
+TEMPORAL_POOLED = {
+    "[sensitivity] Date and Timeframe pooled (date+TIMEFRAME)":       ["date", "TIMEFRAME"],
+    "[sensitivity] Temporal expressions pooled (Y+M+Dates+Adverbs)":  ["Years", "Months", "Dates", "Adverbs"],
+}
 
-        if pd.isna(text) or str(text).strip() == "":
-            return {}
+REPORTED_FIELDS = set(itertools.chain(*ENTITY_FIELDS.values())) | \
+                  set(itertools.chain(*TEMPORAL_FIELDS.values())) | \
+                  set(itertools.chain(*TEMPORAL_DIAGNOSTIC.values())) | {"Answer"}
 
-        lines = str(text).splitlines()
-        entity_dict = {}
-        current_key = None
+def evaluate(path):
+    df = pd.read_excel(path)
+    n_articles = len(df)
+    parsed = [(parse(r["gpt4"]), parse(r["feedback"])) for _, r in df.iterrows()]
 
-        for raw_line in lines:
+    ev = collections.Counter()
+    for P, G in parsed:
+        p = (P.get("Answer", [""]) or [""])[0].strip().lower()
+        g = (G.get("Answer", [""]) or [""])[0].strip().lower()
+        ev[(p == "yes", g == "yes")] += 1
+    e_tp = ev[(True, True)]; e_tn = ev[(False, False)]
+    e_fp = ev[(True, False)]; e_fn = ev[(False, True)]
 
-            line = raw_line.strip()
+    results = []
+    p, r, f = prf(e_tp, e_fp, e_fn)
+    results.append(dict(entity="Event identification", tp=e_tp, fp=e_fp, fn=e_fn, tn=e_tn,
+                        precision=p, recall=r, f1=f,
+                        p_ci=cp(e_tp, e_tp + e_fp), r_ci=cp(e_tp, e_tp + e_fn),
+                        specificity=e_tn / (e_tn + e_fp) if e_tn + e_fp else None,
+                        note="document-level binary, n=%d" % n_articles))
 
-            if not line:
+    def add(label, fields, note=""):
+        t = [0, 0, 0, 0]
+        for P, G in parsed:
+            pv = [v for v in itertools.chain(*[P.get(k, []) for k in fields]) if not MALFORMED.search(str(v))]
+            gv = [v for v in itertools.chain(*[G.get(k, []) for k in fields]) if not MALFORMED.search(str(v))]
+            if not pv and not gv:
                 continue
-
-            if line.startswith("-"):
-                line = line[1:].strip()
-
-            if ":" in line:
-
-                key_part, value_part = line.split(":", 1)
-                key = self.normalize_label(key_part)
-                value = value_part.strip()
-
-                entity_dict.setdefault(key, [])
-                current_key = key
-
-                if value != "":
-                    entity_dict[key].append(value)
-
-            else:
-
-                if current_key is not None:
-                    entity_dict.setdefault(current_key, []).append(line)
-
-        # deduplicate
-        for key, values in entity_dict.items():
-
-            seen = set()
-            deduped = []
-
-            for value in values:
-
-                v = str(value).strip()
-
-                if v.lower() not in seen:
-                    deduped.append(v)
-                    seen.add(v.lower())
-
-            entity_dict[key] = deduped
-
-        return entity_dict
-
-    def get_embedding_sentence_transformers(self, texts):
-
-        embeddings = self.embedding_model.encode(texts)
-
-        if embeddings.ndim == 2 and embeddings.shape[1] > 768:
-            embeddings = embeddings[:, :768]
-
-        return embeddings
-
-    def fuzzy_match(self, prediction, actual, threshold=1.0):
-
-        actual_lower = [str(i).lower() for i in actual]
-        predicted_lower = [str(i).lower() for i in prediction]
-
-        common_lower = set(actual_lower).intersection(predicted_lower)
-
-        actual_filtered = [i for i in actual if str(i).lower() not in common_lower]
-        predicted_filtered = [i for i in prediction if str(i).lower() not in common_lower]
-
-        if not predicted_filtered or not actual_filtered:
-            return prediction
-
-        prediction_embedding = self.get_embedding_sentence_transformers(predicted_filtered)
-        actual_embedding = self.get_embedding_sentence_transformers(actual_filtered)
-
-        cosine_sim_matrix = cosine_similarity(prediction_embedding, actual_embedding)
-
-        for r in range(len(cosine_sim_matrix)):
-            for c in range(len(cosine_sim_matrix[r])):
-                if cosine_sim_matrix[r][c] >= threshold:
-                    cosine_sim_matrix[r][c] = 1
-
-        row_idx, col_idx = linear_sum_assignment(-cosine_sim_matrix)
-
-        term_arr = []
-
-        for i in range(len(row_idx)):
-            if cosine_sim_matrix[row_idx[i], col_idx[i]] == 1:
-                term_arr.append(actual_filtered[col_idx[i]])
-            else:
-                term_arr.append(predicted_filtered[row_idx[i]])
-
-        remaining_idx = set(range(len(predicted_filtered))) - set(row_idx)
-
-        for idx in remaining_idx:
-            term_arr.append(predicted_filtered[idx])
-
-        common_original = [i for i in actual if str(i).lower() in common_lower]
-
-        term_arr.extend(common_original)
-
-        return term_arr
-
-    def merge_entity_labels(self, ner_dict):
-
-        if not ner_dict:
-            return ner_dict
-
-        merged = {}
-
-        for key, values in ner_dict.items():
-
-            key_clean = str(key).strip().lower()
-
-            if key_clean == "chemical substance":
-                key_norm = "CHEMICAL SUBSTANCE"
-
-            elif key_clean == "radiological substance":
-                key_norm = "RADIOLOGICAL SUBSTANCE"
-
-            elif key_clean == "timeframe":
-                key_norm = "TIMEFRAME"
-
-            elif key_clean == "date":
-                key_norm = "date"
-
-            else:
-                key_norm = self.normalize_label(key)
-
-            merged.setdefault(key_norm, []).extend(values)
-
-        for key, values in merged.items():
-
-            seen = set()
-            deduped = []
-
-            for value in values:
-
-                v = str(value).strip()
-
-                if v.lower() not in seen:
-                    deduped.append(v)
-                    seen.add(v.lower())
-
-            merged[key] = deduped
-
-        return merged
-
-    def evaluate_ner(self, predicted_ner, label_ner):
-
-        predicted_ner = self.merge_entity_labels(predicted_ner)
-        label_ner = self.merge_entity_labels(label_ner)
-
-        considered_entities = list(set(predicted_ner.keys()) | set(label_ner.keys()))
-
-        metrics = {}
-
-        for entity_type in considered_entities:
-
-            tp = fp = fn = tn = 0
-
-            if entity_type not in predicted_ner and entity_type not in label_ner:
-                tn += 1
-
-            elif entity_type not in predicted_ner:
-                fn += len(label_ner[entity_type])
-
-            elif entity_type not in label_ner:
-                fp += len(predicted_ner[entity_type])
-
-            else:
-
-                pred = predicted_ner[entity_type]
-                lab = label_ner[entity_type]
-
-                fuzzy = self.fuzzy_match(pred, lab)
-
-                pred_set = {i.lower() for i in fuzzy}
-                lab_set = {i.lower() for i in lab}
-
-                tp = len(pred_set & lab_set)
-                fp = len(pred_set - lab_set)
-                fn = len(lab_set - pred_set)
-
-            metrics[entity_type] = {
-                "TP": tp,
-                "FP": fp,
-                "FN": fn,
-                "TN": tn
-            }
-
-        return metrics
-
-    def calculate_precision(self, tp, fp):
-        return 0 if tp + fp == 0 else tp / (tp + fp)
-
-    def calculate_recall(self, tp, fn):
-        return 0 if tp + fn == 0 else tp / (tp + fn)
-
-    def calculate_f_measure(self, p, r):
-        return 0 if p + r == 0 else 2 * (p * r) / (p + r)
-
-    def clopper_pearson_ci(self, successes, trials, alpha=0.05):
-
-        if trials == 0:
-            return 0, 1
-
-        x = int(successes)
-        n = int(trials)
-
-        low = 0 if x == 0 else beta.ppf(alpha / 2, x, n - x + 1)
-        high = 1 if x == n else beta.ppf(1 - alpha / 2, x + 1, n - x)
-
-        return float(low), float(high)
-
-    def fit(self):
-
-        required_columns = {"feedback", "gpt4"}
-
-        if not required_columns.issubset(self.df.columns):
-            raise ValueError("Dataset must contain 'gpt4' and 'feedback' columns")
-
-        full_eval = {"gpt4": {}}
-
-        for _, row in self.df.iterrows():
-
-            actual = row["feedback"]
-            prediction = row["gpt4"]
-
-            actual_dict = self.convert_entities_to_dictionary(actual)
-            pred_dict = self.convert_entities_to_dictionary(prediction)
-
-            evaluation = self.evaluate_ner(pred_dict, actual_dict)
-
-            for entity, scores in evaluation.items():
-
-                if entity not in full_eval["gpt4"]:
-                    full_eval["gpt4"][entity] = scores.copy()
-
-                else:
-                    for k in scores:
-                        full_eval["gpt4"][entity][k] += scores[k]
-
-        allowed_entities = {
-            "Answer",
-            "CHEMICAL SUBSTANCE",
-            "RADIOLOGICAL SUBSTANCE",
-            "FATALITY COUNT",
-            "CASE NUMBER",
-            "STATE",
-            "COUNTY",
-            "CITY",
-            "LOCATION",
-            "TIMEFRAME",
-            "Years",
-            "Months",
-            "Dates",
-            "date",
-            "Dates or days of the week",
-            "Adverbs",
-        }
-
-        # Reporting rename
-        reporting_names = {
-            "LOCATION": "COUNTRY",
-            "Answer": "Event identification"
-        }
-
-        rows = []
-
-        for entity, m in full_eval["gpt4"].items():
-
-            if entity not in allowed_entities:
-                continue
-
-            p = self.calculate_precision(m["TP"], m["FP"])
-            r = self.calculate_recall(m["TP"], m["FN"])
-            f = self.calculate_f_measure(p, r)
-
-            p_low, p_high = self.clopper_pearson_ci(m["TP"], m["TP"] + m["FP"])
-            r_low, r_high = self.clopper_pearson_ci(m["TP"], m["TP"] + m["FN"])
-
-            entity_name = reporting_names.get(entity, entity)
-
-            rows.append({
-                "ENTITY_TYPE": entity_name,
-                "precision": p,
-                "precision_ci_low": p_low,
-                "precision_ci_high": p_high,
-                "recall": r,
-                "recall_ci_low": r_low,
-                "recall_ci_high": r_high,
-                "fmeasure": f,
-                "TP": m["TP"],
-                "FP": m["FP"],
-                "FN": m["FN"],
-                "TN": m["TN"],
-            })
-
-        return pd.DataFrame(rows)
+            s = score_set(pv, gv)
+            for i in range(4):
+                t[i] += s[i]
+        tp, fp, fn, tn = t
+        p, r, f = prf(tp, fp, fn)
+        results.append(dict(entity=label, tp=tp, fp=fp, fn=fn, tn=tn,
+                            precision=p, recall=r, f1=f,
+                            p_ci=cp(tp, tp + fp), r_ci=cp(tp, tp + fn),
+                            specificity=None, note=note or "+".join(fields)))
+
+    for label, fields in ENTITY_FIELDS.items():
+        add(label, fields)
+    for label, fields in TEMPORAL_FIELDS.items():
+        add(label, fields)
+    for label, fields in TEMPORAL_DIAGNOSTIC.items():
+        add(label, fields)
+    for label, fields in TEMPORAL_POOLED.items():
+        add(label, fields)
+
+    excluded = collections.Counter()
+    for P, G in parsed:
+        for d in (P, G):
+            for k, vs in d.items():
+                if k not in REPORTED_FIELDS:
+                    excluded[k] += len(vs)
+
+    return pd.DataFrame(results), excluded, n_articles, ev
+
+
+def fmt(ci):
+    return "n/a" if ci is None or ci[0] is None else "%.2f-%.2f" % ci
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", default="evaluation_dataset_200_articles.xlsx")
+    ap.add_argument("--output", default="chem_llm_eval_results.csv")
+    a = ap.parse_args()
 
-    parser = argparse.ArgumentParser()
+    res, excl, n, ev = evaluate(a.input)
 
-    parser.add_argument(
-        "--input",
-        default="evaluation_dataset_200_articles.xlsx"
-    )
+    print("Articles evaluated: %d\n" % n)
+    print("Event identification 2x2 (document level)")
+    print("  pred Yes / gold Yes : %3d   (TP)" % ev[(True, True)])
+    print("  pred No  / gold No  : %3d   (TN)" % ev[(False, False)])
+    print("  pred Yes / gold No  : %3d   (FP)" % ev[(True, False)])
+    print("  pred No  / gold Yes : %3d   (FN)" % ev[(False, True)])
+    print("  total               : %3d\n" % sum(ev.values()))
 
-    parser.add_argument(
-        "--output",
-        default="evaluation_results.csv"
-    )
+    hdr = "%-58s %5s %4s %4s %5s  %-6s %-12s  %-6s %-12s %-6s" % (
+        "Entity", "TP", "FP", "FN", "TN", "Prec", "95% CI", "Rec", "95% CI", "F1")
+    print(hdr); print("-" * len(hdr))
+    for _, x in res.iterrows():
+        print("%-58s %5d %4d %4d %5d  %-6.3f %-12s  %-6.3f %-12s %-6.3f" % (
+            x.entity, x.tp, x.fp, x.fn, x.tn,
+            x.precision, fmt(x.p_ci), x.recall, fmt(x.r_ci), x.f1))
 
-    parser.add_argument(
-        "--embedding_model",
-        default="sentence-transformers/all-MiniLM-L6-v2"
-    )
+    print("\nEntity keys present in annotations but NOT reported (%d values):" % sum(excl.values()))
+    for k, v in excl.most_common():
+        print("  %5d  %s" % (v, k))
 
-    args = parser.parse_args()
-
-    evaluator = NEREvaluation(args.input, args.embedding_model)
-
-    output_df = evaluator.fit()
-
-    output_df.to_csv(args.output, index=False)
-
-    print("Saved evaluation results to:", args.output)
+    out = res.copy()
+    out["precision_ci_low"] = [c[0] if c else None for c in out.p_ci]
+    out["precision_ci_high"] = [c[1] if c else None for c in out.p_ci]
+    out["recall_ci_low"] = [c[0] if c else None for c in out.r_ci]
+    out["recall_ci_high"] = [c[1] if c else None for c in out.r_ci]
+    out.drop(columns=["p_ci", "r_ci"]).to_csv(a.output, index=False)
+    print("\nSaved:", a.output)
 
 
 if __name__ == "__main__":
+    main()
     main()
